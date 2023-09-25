@@ -4,10 +4,19 @@
 
 """
 Usage:
-put `TGBOT_KEY=xxx:xxxxxx` in `.env` file, then run
+1. Message @BotFather to create a new bot, set the following commands with your bot.
+```
+start - Start using this bot
+verify_address - Verify address
+bind_address - Bind address
+```
 
-pip3 install python-telegram-bot
+2. Run `pip3 install -r requirements.txt ` to install dependencies.
+
+3. Put `TGBOT_KEY=xxx:xxxxxx` in `.env` file, then run
+```
 python3 ./tg_bot.py
+```
 
 Press Ctrl-C on the command line or send a signal to the process to stop the
 bot.
