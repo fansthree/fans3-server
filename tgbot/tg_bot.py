@@ -30,11 +30,12 @@ from telegram import (
     Chat,
     ChatMember,
     ChatMemberUpdated,
+    ChatPermissions,
     Update,
     ReplyKeyboardRemove,
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Updater,
@@ -130,12 +131,35 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.info("%s blocked the bot", cause_name)
             context.bot_data.setdefault("user_ids", set()).discard(chat.id)
     elif chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        if was_member and not is_member:
+            logger.info("%s removed the bot from the group %s", cause_name, chat.title)
+            context.bot_data.setdefault("group_ids", set()).discard(chat.id)
+            return
         if not was_member and is_member:
             logger.info("%s added the bot to the group %s", cause_name, chat.title)
             context.bot_data.setdefault("group_ids", set()).add(chat.id)
-        elif was_member and not is_member:
-            logger.info("%s removed the bot from the group %s", cause_name, chat.title)
-            context.bot_data.setdefault("group_ids", set()).discard(chat.id)
+        # check if the bot is admin
+        member = update.my_chat_member.new_chat_member
+        if member.status != ChatMemberStatus.ADMINISTRATOR:
+            await update.effective_chat.send_message(
+                "Please promote me to admin to work."
+            )
+        else:
+            # we are admin, now set permission
+            current = (await context.bot.get_chat(chat.id)).permissions
+            if current.can_invite_users == False:
+                await update.effective_chat.send_message(
+                    "Permission already changed to disallow users to invite others."
+                )
+                return
+            perms = current.to_dict()
+            perms["can_invite_users"] = False
+            await update.effective_chat.set_permissions(
+                ChatPermissions(api_kwargs=perms)
+            )
+            await update.effective_chat.send_message(
+                "Permission changed to disallow users to invite others."
+            )
     elif not was_member and is_member:
         logger.info("%s added the bot to the channel %s", cause_name, chat.title)
         context.bot_data.setdefault("channel_ids", set()).add(chat.id)
