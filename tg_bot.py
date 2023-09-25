@@ -3,18 +3,27 @@
 # This program is dedicated to the public domain under the CC0 license.
 
 """
-Simple Bot to handle '(my_)chat_member' updates.
-Greets new users & keeps track of which chats the bot is in.
-
 Usage:
+put `TGBOT_KEY=xxx:xxxxxx` in `.env` file, then run
+
+pip3 install python-telegram-bot
+python3 ./tg_bot.py
+
 Press Ctrl-C on the command line or send a signal to the process to stop the
 bot.
 """
 
-import logging
+import logging, os, sys
 from typing import Optional, Tuple
 
-from telegram import Bot, Chat, ChatMember, ChatMemberUpdated, Update, ReplyKeyboardRemove
+from telegram import (
+    Bot,
+    Chat,
+    ChatMember,
+    ChatMemberUpdated,
+    Update,
+    ReplyKeyboardRemove,
+)
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
@@ -28,8 +37,18 @@ from telegram.ext import (
     MessageHandler,
     filters,
     CallbackQueryHandler,
-    ConversationHandler
+    ConversationHandler,
 )
+
+from dotenv import load_dotenv
+
+# add source dir
+# file_dir = os.path.dirname(__file__)
+# sys.path.append(file_dir)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# add env
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+sys.path.append(BASE_DIR)
 
 # Enable logging
 
@@ -42,18 +61,23 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-token = "xxxxx:xxxxxxxxxxxxxx"
+token = os.environ["TGBOT_KEY"]
 bot = Bot(token)
 
 join_request_cache = {}
 
-def extract_status_change(chat_member_update: ChatMemberUpdated) -> Optional[Tuple[bool, bool]]:
+
+def extract_status_change(
+    chat_member_update: ChatMemberUpdated,
+) -> Optional[Tuple[bool, bool]]:
     """Takes a ChatMemberUpdated instance and extracts whether the 'old_chat_member' was a member
     of the chat and whether the 'new_chat_member' is a member of the chat. Returns None, if
     the status didn't change.
     """
     status_change = chat_member_update.difference().get("status")
-    old_is_member, new_is_member = chat_member_update.difference().get("is_member", (None, None))
+    old_is_member, new_is_member = chat_member_update.difference().get(
+        "is_member", (None, None)
+    )
 
     if status_change is None:
         return None
@@ -111,7 +135,9 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.bot_data.setdefault("channel_ids", set()).discard(chat.id)
 
 
-async def greet_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def greet_chat_members(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """Greets new users in chats and announces when someone leaves"""
     result = extract_status_change(update.chat_member)
     if result is None:
@@ -133,7 +159,9 @@ async def greet_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 
-async def start_private_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_private_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """Greets the user and records that they started a chat with the bot if it's a private chat.
     Since no `my_chat_member` update is issued when a user starts a private chat with the bot
     for the first time, we have to track it explicitly here.
@@ -149,6 +177,7 @@ async def start_private_chat(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.effective_message.reply_text(
         f"Welcome {user_name}. Use /show_chats to see what chats I'm in."
     )
+
 
 # async def setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 #     """Sends a message with three inline buttons attached."""
@@ -191,6 +220,7 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.edit_message_text(text="See you next time!")
     return ConversationHandler.END
 
+
 async def bind_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     address = update.message.text.split(" ")[-1]
@@ -198,9 +228,12 @@ async def bind_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # TODO, request http to check&save
     await update.message.reply_text(f"Success!")
 
+
 async def create_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # link = await Chat(update.effective_chat, type=Chat.SUPERGROUP).create_invite_link()
-    link = await update.effective_chat.create_invite_link(member_limit=100, creates_join_request=True)
+    link = await update.effective_chat.create_invite_link(
+        member_limit=100, creates_join_request=True
+    )
     print("create invite link", link.invite_link)
     await update.effective_message.reply_text(link.invite_link)
 
@@ -220,13 +253,16 @@ async def join_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = "You have to verify&bind your wallet address first"
         reply_markup = InlineKeyboardMarkup.from_button(
-        InlineKeyboardButton(
-            text="verify & bind your wallet address",
-            callback_data=f"verify {chat.id}",
+            InlineKeyboardButton(
+                text="verify & bind your wallet address",
+                callback_data=f"verify {chat.id}",
+            )
         )
-    )
         message = await context.bot.send_message(
-            chat_id=update.chat_join_request.user_chat_id, text=text, reply_markup= reply_markup)
+            chat_id=update.chat_join_request.user_chat_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
     except Forbidden:
         # If the user blocked the bot, let's give the admins a chance to handle that
         # TG also notifies the user and forwards the message once the user unblocks the bot, but
@@ -239,6 +275,7 @@ async def join_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # await context.bot.send_message(chat_id=ERROR_CHANNEL_CHAT_ID, text=text)
         return
 
+
 async def start_verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     _, chat_id = query.data.split(" ")
@@ -247,8 +284,10 @@ async def start_verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     print(f"verify user:{update.callback_query.from_user.id} joining chat:{chat_id}")
     text = f"Please use /verify_address your_wallet_address to verfiy your address"
     message = await context.bot.send_message(
-        chat_id=update.effective_chat.id, text=text, reply_markup=ReplyKeyboardRemove())
+        chat_id=update.effective_chat.id, text=text, reply_markup=ReplyKeyboardRemove()
+    )
     return "verify_address"
+
 
 async def verify_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     print(update.message.text)
@@ -257,38 +296,47 @@ async def verify_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if requested_chat_id is None:
         print(f"verify_address cannot find user from request")
         return
-    #TODO, request server to checkout whether user has bought shares
+    # TODO, request server to checkout whether user has bought shares
     if True:
-
         print(f"approve user:{user_id} joining chat:{requested_chat_id}")
-        await context.bot.approve_chat_join_request(requested_chat_id, user_id) 
+        await context.bot.approve_chat_join_request(requested_chat_id, user_id)
     else:
         print(f"decline user:{user_id} joining chat:{requested_chat_id}")
         await context.bot.decline_chat_join_request(requested_chat_id, user_id)
     return "end"
 
-# reference & examples
-#https://github.com/python-telegram-bot/python-telegram-bot/blob/master/examples/conversationbot.py
-#https://github.com/python-telegram-bot/rules-bot/blob/af3d63e83b73124cb4b374f9633f1c40fb2ac23d/components/joinrequests.py
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Invite this bot to your group to turn it into a Fans3 club!"
+    )
+
+
+# reference & examples
+# https://github.com/python-telegram-bot/python-telegram-bot/blob/master/examples/conversationbot.py
+# https://github.com/python-telegram-bot/rules-bot/blob/af3d63e83b73124cb4b374f9633f1c40fb2ac23d/components/joinrequests.py
 def main() -> None:
     """Start the bot."""
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(token).build()
 
+    application.add_handler(CommandHandler("start", start))
+
     application.add_handler(ChatJoinRequestHandler(callback=join_handler))
     # application.add_handler(CallbackQueryHandler(verify, pattern="^verify"))
-    application.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_verify, pattern="^verify")],
-        states={
-            "verify_address":[
-                CommandHandler("verify_address", verify_address)
-                # MessageHandler(filters=filters.ALL , callback=verify_start)
+    application.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(start_verify, pattern="^verify")],
+            states={
+                "verify_address": [
+                    CommandHandler("verify_address", verify_address)
+                    # MessageHandler(filters=filters.ALL , callback=verify_start)
                 ],
-            # "end":[CallbackQueryHandler(verify, pattern="^verify")]
-        },
-        fallbacks=[CallbackQueryHandler(start_verify, pattern="^verify")]
-    ))
+                # "end":[CallbackQueryHandler(verify, pattern="^verify")]
+            },
+            fallbacks=[CallbackQueryHandler(start_verify, pattern="^verify")],
+        )
+    )
 
     application.add_handler(CommandHandler("bind_address", bind_address))
     application.add_handler(CommandHandler("create_invite_link", create_invite_link))
@@ -297,11 +345,14 @@ def main() -> None:
     # application.add_handler(CallbackQueryHandler(button))
 
     # # Keep track of which chats the bot is in
-    application.add_handler(ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER))
-
+    application.add_handler(
+        ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
 
     # # Handle members joining/leaving chats.
-    application.add_handler(ChatMemberHandler(greet_chat_members, ChatMemberHandler.CHAT_MEMBER))
+    application.add_handler(
+        ChatMemberHandler(greet_chat_members, ChatMemberHandler.CHAT_MEMBER)
+    )
 
     # Interpret any other command or text message as a start of a private chat.
     # This will record the user as being in a private chat with bot.
