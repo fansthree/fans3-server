@@ -137,7 +137,7 @@ async def check_supply(chat: Chat, address: str):
                         InlineKeyboardButton(
                             "Buy your first share",
                             login_url=LoginUrl(
-                                f"{BASE_URL}/tg_create?tg="
+                                f"{BASE_URL}/tg/create?tg="
                                 + urllib.parse.quote(f"{chat.title}(id: {chat.id})"),
                             ),
                         ),
@@ -148,7 +148,7 @@ async def check_supply(chat: Chat, address: str):
         return
 
     await chat.send_message(
-        f"You are all set!\n\nNow your fans can buy your share at {BASE_URL}/tg_buy/{address} to join your group!"
+        f"You are all set!\n\nNow your fans can buy your share at {BASE_URL}/tg/buy/{address} to join your group!"
     )
 
 
