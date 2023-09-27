@@ -9,6 +9,7 @@ Usage:
 start - Start using this bot
 verify_address - Verify address
 bind_address - Bind address
+get_link - Get join link
 ```
 
 2. Run `pip3 install -r requirements.txt ` to install dependencies.
@@ -22,7 +23,8 @@ Press Ctrl-C on the command line or send a signal to the process to stop the
 bot.
 """
 
-import logging, os, sys
+import logging, os, sys, urllib, json
+
 from typing import Optional, Tuple
 
 from telegram import (
@@ -31,10 +33,13 @@ from telegram import (
     ChatMember,
     ChatMemberUpdated,
     ChatPermissions,
+    ForceReply,
+    LoginUrl,
     Update,
     ReplyKeyboardRemove,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
@@ -51,6 +56,7 @@ from telegram.ext import (
 )
 
 from dotenv import load_dotenv
+from web3 import Web3, HTTPProvider
 
 # add source dir
 # file_dir = os.path.dirname(__file__)
@@ -59,6 +65,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # add env
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 sys.path.append(BASE_DIR)
+
+BASE_URL = os.environ["BASE_URL"]
+START, CREATE, JOIN = range(3)
+KEY_ADDRESS = "address"
+KEY_BIND_ADDRESS = "bind_address"
+ABI = json.load(open("fans3.json"))
+w3 = Web3(HTTPProvider(os.environ["ETH_RPC"]))
+
+if ABI == None:
+    logger.error("fans3 abi not found in `fans3.json`")
 
 # Enable logging
 
@@ -70,9 +86,8 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
-
-token = os.environ["TGBOT_KEY"]
-bot = Bot(token)
+if os.environ["LOG_LEVEL"] != None:
+    logger.setLevel(os.environ["LOG_LEVEL"])
 
 join_request_cache = {}
 
@@ -107,8 +122,39 @@ def extract_status_change(
     return was_member, is_member
 
 
+async def check_supply(chat: Chat, address: str):
+    # check if your first share is bought
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(os.environ["CONTRACT_ADDRESS"]), abi=ABI
+    )
+    supply = contract.functions.sharesSupply(Web3.to_checksum_address(address)).call()
+    if supply == 0:
+        await chat.send_message(
+            "Now buy your first share to let others buy and join your group.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Buy your first share",
+                            login_url=LoginUrl(
+                                f"{BASE_URL}/tg_create?tg="
+                                + urllib.parse.quote(f"{chat.title}(id: {chat.id})"),
+                            ),
+                        ),
+                    ]
+                ]
+            ),
+        )
+        return
+
+    await chat.send_message(
+        f"You are all set!\n\nNow your fans can buy your share at {BASE_URL}/tg_buy/{address} to join your group!"
+    )
+
+
 async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Tracks the chats the bot is in."""
+    logger.debug(update)
     result = extract_status_change(update.my_chat_member)
     if result is None:
         return
@@ -138,34 +184,66 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not was_member and is_member:
             logger.info("%s added the bot to the group %s", cause_name, chat.title)
             context.bot_data.setdefault("group_ids", set()).add(chat.id)
+
         # check if the bot is admin
         member = update.my_chat_member.new_chat_member
         if member.status != ChatMemberStatus.ADMINISTRATOR:
             await update.effective_chat.send_message(
                 "Please promote me to admin to work."
             )
-        else:
-            # we are admin, now set permission
-            current = (await context.bot.get_chat(chat.id)).permissions
-            if current.can_invite_users == False:
-                await update.effective_chat.send_message(
-                    "Permission already changed to disallow users to invite others."
-                )
-                return
+            return
+
+        # we are admin, now check group permission
+        current = (await context.bot.get_chat(chat.id)).permissions
+        if current.can_invite_users != False:
             perms = current.to_dict()
             perms["can_invite_users"] = False
             await update.effective_chat.set_permissions(
                 ChatPermissions(api_kwargs=perms)
             )
-            await update.effective_chat.send_message(
+            update.effective_chat.send_message(
                 "Permission changed to disallow users to invite others."
             )
+
+        # check if we know group wallet address
+        address = context.chat_data.get(KEY_ADDRESS)
+        if address == None:
+            context.chat_data.setdefault(KEY_BIND_ADDRESS, True)
+            await update.effective_chat.send_message(
+                "Now Tell us your wallet address, so that anyone bought your share can join this group.",
+                reply_markup=ForceReply(
+                    input_field_placeholder="Enter your wallet address"
+                ),
+            )
+            return
+
+        await check_supply(chat, address)
+
     elif not was_member and is_member:
         logger.info("%s added the bot to the channel %s", cause_name, chat.title)
         context.bot_data.setdefault("channel_ids", set()).add(chat.id)
     elif was_member and not is_member:
         logger.info("%s removed the bot from the channel %s", cause_name, chat.title)
         context.bot_data.setdefault("channel_ids", set()).discard(chat.id)
+
+
+async def reply_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.debug(update)
+    logger.debug(context)
+    if context.chat_data.get(KEY_BIND_ADDRESS) != True:
+        return
+    address = update.message.text
+    if not Web3.is_address(address):
+        await update.message.reply_text(
+            f"{address} is not a valid address, please enter a valid one.",
+            reply_markup=ForceReply(
+                input_field_placeholder="Please enter your wallet address"
+            ),
+        )
+        return
+    context.chat_data.setdefault(KEY_ADDRESS, address)
+    del context.chat_data[KEY_BIND_ADDRESS]
+    await check_supply(update.effective_chat, address)
 
 
 async def greet_chat_members(
@@ -257,9 +335,16 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def bind_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     address = update.message.text.split(" ")[-1]
-    print(f"bind success {user_id} with {address}")
-    # TODO, request http to check&save
-    await update.message.reply_text(f"Success!")
+    if not Web3.is_address(address):
+        await update.message.reply_text(
+            f"{address} is not a valid address, please enter a valid one.",
+            reply_markup=ForceReply(
+                input_field_placeholder="Please enter your wallet address"
+            ),
+        )
+        return
+    context.chat_data.setdefault(KEY_ADDRESS, address)
+    await check_supply(update.effective_chat, address)
 
 
 async def create_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,10 +424,51 @@ async def verify_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return "end"
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.debug(update)
     await update.message.reply_text(
-        "Invite this bot to your group to turn it into a Fans3 club!"
+        "Thanks for choosing Fans3, to continue, please choose if you want to create or join a Fans3 group",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Create", callback_data=str(CREATE)),
+                    InlineKeyboardButton("Join", callback_data=str(JOIN)),
+                ]
+            ]
+        ),
     )
+    return START
+
+
+async def create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle create request."""
+    logger.debug(update)
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(None)
+    await query.message.reply_text(
+        "Invite this bot to your group to turn it into a Fans3 group!"
+    )
+    return ConversationHandler.END
+
+
+async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle join request."""
+    logger.debug(update)
+    query = update.callback_query
+    await query.answer()
+    # @todo TBD.
+    await query.edit_message_reply_markup(None)
+    await query.message.reply_text("Not finished yet.")
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancels and ends the conversation."""
+    user = update.message.from_user
+    logger.info("User %s canceled the conversation.", user.first_name)
+    await update.message.reply_text("You can start with /start again at any time.")
+    return ConversationHandler.END
 
 
 # reference & examples
@@ -351,9 +477,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     """Start the bot."""
     # Create the Application and pass it your bot's token.
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(os.environ["TGBOT_KEY"]).build()
 
-    application.add_handler(CommandHandler("start", start))
+    application.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("start", start)],
+            states={
+                START: [
+                    CallbackQueryHandler(create, pattern="^" + str(CREATE) + "$"),
+                    CallbackQueryHandler(join, pattern="^" + str(JOIN) + "$"),
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+    )
 
     application.add_handler(ChatJoinRequestHandler(callback=join_handler))
     # application.add_handler(CallbackQueryHandler(verify, pattern="^verify"))
@@ -372,7 +509,7 @@ def main() -> None:
     )
 
     application.add_handler(CommandHandler("bind_address", bind_address))
-    application.add_handler(CommandHandler("create_invite_link", create_invite_link))
+    application.add_handler(CommandHandler("get_link", create_invite_link))
 
     # application.add_handler(CommandHandler("setting", setting))
     # application.add_handler(CallbackQueryHandler(button))
@@ -381,6 +518,7 @@ def main() -> None:
     application.add_handler(
         ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER)
     )
+    application.add_handler(MessageHandler(filters.REPLY, reply_address))
 
     # # Handle members joining/leaving chats.
     application.add_handler(
