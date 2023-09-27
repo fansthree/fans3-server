@@ -208,6 +208,14 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # check if we know group wallet address
         address = context.chat_data.get(KEY_ADDRESS)
         if address == None:
+            member = await context.bot.get_chat_member(
+                update.effective_chat.id, update.my_chat_member.from_user.id
+            )
+            if member.status != ChatMemberStatus.OWNER:
+                await update.effective_chat.send_message(
+                    "Group owner needs to set group address with command /bind_address."
+                )
+                return
             context.chat_data.setdefault(KEY_BIND_ADDRESS, True)
             await update.effective_chat.send_message(
                 "Now Tell us your wallet address, so that anyone bought your share can join this group.",
@@ -230,6 +238,12 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def reply_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.debug(update)
     logger.debug(context)
+    member = await context.bot.get_chat_member(
+        update.effective_chat.id, update.message.from_user.id
+    )
+    if member.status != ChatMemberStatus.OWNER:
+        await update.message.reply_text("Only owner can do this.")
+        return
     if context.chat_data.get(KEY_BIND_ADDRESS) != True:
         return
     address = update.message.text
@@ -333,18 +347,25 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def bind_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    address = update.message.text.split(" ")[-1]
-    if not Web3.is_address(address):
-        await update.message.reply_text(
-            f"{address} is not a valid address, please enter a valid one.",
-            reply_markup=ForceReply(
-                input_field_placeholder="Please enter your wallet address"
-            ),
-        )
+    member = await context.bot.get_chat_member(
+        update.effective_chat.id, update.message.from_user.id
+    )
+    if member.status != ChatMemberStatus.OWNER:
+        await update.message.reply_text("Only owner can do this.")
         return
-    context.chat_data.setdefault(KEY_ADDRESS, address)
-    await check_supply(update.effective_chat, address)
+    address = context.chat_data.get(KEY_ADDRESS)
+    if address == None:
+        message = "Please enter your wallet address."
+    else:
+        message = f"Your group address is {address}, change this will kick all members that do not own new one."
+    context.chat_data.setdefault(KEY_BIND_ADDRESS, True)
+    await update.message.reply_text(
+        message,
+        reply_markup=ForceReply(
+            input_field_placeholder="Please enter your wallet address"
+        ),
+    )
+    return
 
 
 async def create_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
