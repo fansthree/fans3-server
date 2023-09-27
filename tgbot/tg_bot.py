@@ -11,10 +11,11 @@ verify_address - Verify address
 bind_address - Bind address
 get_link - Get join link
 ```
+2. use /set_domain to allow domain `demo.fans3.org`
 
-2. Run `pip3 install -r requirements.txt ` to install dependencies.
+3. Run `pip3 install -r requirements.txt ` to install dependencies.
 
-3. Put `TGBOT_KEY=xxx:xxxxxx` in `.env` file, then run
+4. Put `TGBOT_KEY=xxx:xxxxxx` in `.env` file, then run
 ```
 python3 ./tg_bot.py
 ```
@@ -67,8 +68,9 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 sys.path.append(BASE_DIR)
 
 BASE_URL = os.environ["BASE_URL"]
-START, CREATE, JOIN = range(3)
+CANCEL, START, CREATE, JOIN, LIST, ADDRESS = range(6)
 KEY_ADDRESS = "address"
+KEY_CHATS = "chats"
 KEY_BIND_ADDRESS = "bind_address"
 ABI = json.load(open("fans3.json"))
 w3 = Web3(HTTPProvider(os.environ["ETH_RPC"]))
@@ -122,7 +124,7 @@ def extract_status_change(
     return was_member, is_member
 
 
-async def check_supply(chat: Chat, address: str):
+async def check_supply(chat: Chat, address: str, context: ContextTypes.DEFAULT_TYPE):
     # check if your first share is bought
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(os.environ["CONTRACT_ADDRESS"]), abi=ABI
@@ -147,6 +149,9 @@ async def check_supply(chat: Chat, address: str):
         )
         return
 
+    context.bot_data.setdefault(KEY_CHATS, set()).add(chat)
+    context.bot_data.setdefault(f"ADDR_{chat.id}", address)
+    context.bot_data.setdefault(f"CHAT_{address}", chat)
     await chat.send_message(
         f"You are all set!\n\nNow your fans can buy your share at {BASE_URL}/tg/buy/{address} to join your group!"
     )
@@ -225,7 +230,7 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        await check_supply(chat, address)
+        await check_supply(chat, address, context)
 
     elif not was_member and is_member:
         logger.info("%s added the bot to the channel %s", cause_name, chat.title)
@@ -257,7 +262,7 @@ async def reply_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.chat_data.setdefault(KEY_ADDRESS, address)
     del context.chat_data[KEY_BIND_ADDRESS]
-    await check_supply(update.effective_chat, address)
+    await check_supply(update.effective_chat, address, context)
 
 
 async def greet_chat_members(
@@ -452,43 +457,118 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("Create", callback_data=str(CREATE)),
-                    InlineKeyboardButton("Join", callback_data=str(JOIN)),
-                ]
+                    InlineKeyboardButton("Create a group", callback_data=str(CREATE)),
+                    InlineKeyboardButton("Join a group", callback_data=str(JOIN)),
+                ],
+                [
+                    InlineKeyboardButton("List known groups", callback_data=str(LIST)),
+                    InlineKeyboardButton("Cancel", callback_data=str(CANCEL)),
+                ],
             ]
         ),
     )
     return START
 
 
-async def create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle create request."""
     logger.debug(update)
     query = update.callback_query
-    await query.answer()
-    await query.edit_message_reply_markup(None)
+    await query.answer("Invite this bot to your group to turn it into a Fans3 group!")
     await query.message.reply_text(
         "Invite this bot to your group to turn it into a Fans3 group!"
     )
+    await query.delete_message()
     return ConversationHandler.END
 
 
-async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def join_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle join request."""
     logger.debug(update)
     query = update.callback_query
-    await query.answer()
-    # @todo TBD.
-    await query.edit_message_reply_markup(None)
-    await query.message.reply_text("Not finished yet.")
+    await query.message.reply_text(
+        "Tell me your wallet address to list your shares",
+        reply_markup=ForceReply(input_field_placeholder="Please enter your address"),
+    )
+    await query.delete_message()
+    return ADDRESS
+
+
+async def join_group_with_address(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle user address binding."""
+    logger.debug(update)
+    address = update.message.text
+    if not Web3.is_address(address):
+        await query.edit_message_text(
+            f"{address} is not a valid address, please enter a valid one",
+            reply_markup=ForceReply(
+                input_field_placeholder="Please enter your address"
+            ),
+        )
+        return ADDRESS
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(os.environ["CONTRACT_ADDRESS"]), abi=ABI
+    )
+    holdings = contract.functions.getHoldings(
+        Web3.to_checksum_address(Web3.to_checksum_address(address))
+    ).call()
+    if holdings == None or len(holdings) == 0:
+        await update.message.reply_text(
+            "You don't have any group share yet, to continue, please create one or list known groups",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Create a group", callback_data=str(CREATE)
+                        ),
+                        InlineKeyboardButton(
+                            "List known groups", callback_data=str(LIST)
+                        ),
+                        InlineKeyboardButton("Cancel", callback_data=str(CANCEL)),
+                    ],
+                ]
+            ),
+        )
+        return START
+    message = "Here are your group shares, click to join!\n\n"
+    for holding in holdings:
+        chat = context.bot_data.get(f"CHAT_{holding}")
+        title = "Unknown"
+        link = "#"
+        if chat != None:
+            title = chat.title
+            link = context.bot.export_chat_invite_link(chat.id)
+        message += f"<a href='{link}'>{title}({holding})</a>\n"
+    await update.message.reply_html(message)
+    return ConversationHandler.END
+
+
+async def list_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle list request."""
+    query = update.callback_query
+    chats = context.bot_data.get(KEY_CHATS)
+    if chats == None:
+        await query.answer("No group yet, you can create one")
+        return START
+    await query.answer("Select a group to buy share and join")
+    await query.delete_message()
+    message = "Here are known groups, buy a share and join!\n\n"
+    for chat in chats:
+        address = context.bot_data.get(f"ADDR_{chat.id}")
+        message += (
+            f"<a href='{BASE_URL}/tg/buy/{address}'>{chat.title}({address})</a>\n"
+        )
+    await query.message.reply_html(message)
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancels and ends the conversation."""
-    user = update.message.from_user
-    logger.info("User %s canceled the conversation.", user.first_name)
-    await update.message.reply_text("You can start with /start again at any time.")
+    query = update.callback_query
+    await query.delete_message()
+    await query.message.reply_text("You can start with /start again at any time.")
     return ConversationHandler.END
 
 
@@ -505,8 +585,13 @@ def main() -> None:
             entry_points=[CommandHandler("start", start)],
             states={
                 START: [
-                    CallbackQueryHandler(create, pattern="^" + str(CREATE) + "$"),
-                    CallbackQueryHandler(join, pattern="^" + str(JOIN) + "$"),
+                    CallbackQueryHandler(create_group, pattern="^" + str(CREATE) + "$"),
+                    CallbackQueryHandler(join_group, pattern="^" + str(JOIN) + "$"),
+                    CallbackQueryHandler(list_group, pattern="^" + str(LIST) + "$"),
+                    CallbackQueryHandler(cancel, pattern="^" + str(CANCEL) + "$"),
+                ],
+                ADDRESS: [
+                    MessageHandler(filters.REPLY, join_group_with_address),
                 ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
