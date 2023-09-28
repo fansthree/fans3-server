@@ -82,10 +82,7 @@ db = Rdict("tg.db")
 
 
 def db_get(key: str) -> str:
-    return db.get(key, "")
-    # if value == None:
-    #     return None
-    # return str(value, "utf-8")
+    return db.get(key, None)
 
 
 def db_set(key: str, value: str):
