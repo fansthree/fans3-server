@@ -1,6 +1,5 @@
 python-dotenv
 python-telegram-bot
 web3
-urllib
-json
 pysocks
+rocksdict

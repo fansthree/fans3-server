@@ -24,7 +24,7 @@ Press Ctrl-C on the command line or send a signal to the process to stop the
 bot.
 """
 
-import logging, os, sys, urllib, json
+import logging, os, sys, urllib, json, traceback, base64
 
 from typing import Optional, Tuple
 
@@ -58,6 +58,9 @@ from telegram.ext import (
 
 from dotenv import load_dotenv
 from web3 import Web3, HTTPProvider
+from eth_account.messages import encode_defunct
+from eth_account import Account
+from rocksdict import Rdict, Options
 
 # add source dir
 # file_dir = os.path.dirname(__file__)
@@ -69,11 +72,30 @@ sys.path.append(BASE_DIR)
 
 BASE_URL = os.environ["BASE_URL"]
 CANCEL, START, CREATE, JOIN, LIST, ADDRESS = range(6)
-KEY_ADDRESS = "address"
-KEY_CHATS = "chats"
+PREFIX_CHAT_ADDRESS = "chat_addr_"
+PREFIX_USER_ADDRESS = "user_addr_"
+PREFIX_CHAT_INFO = "chat_info_"
 KEY_BIND_ADDRESS = "bind_address"
 ABI = json.load(open("fans3.json"))
 w3 = Web3(HTTPProvider(os.environ["ETH_RPC"]))
+db = Rdict("tg.db")
+
+
+def db_get(key: str) -> str:
+    return db.get(key, "")
+    # if value == None:
+    #     return None
+    # return str(value, "utf-8")
+
+
+def db_set(key: str, value: str):
+    db[key] = value
+    # bytes(value, "utf-8")
+
+
+def db_range(start: str, reverse: bool = False):
+    return db.items(from_key=start, backwards=reverse)
+
 
 if ABI == None:
     logger.error("fans3 abi not found in `fans3.json`")
@@ -149,9 +171,7 @@ async def check_supply(chat: Chat, address: str, context: ContextTypes.DEFAULT_T
         )
         return
 
-    context.bot_data.setdefault(KEY_CHATS, set()).add(chat)
-    context.bot_data.setdefault(f"ADDR_{chat.id}", address)
-    context.bot_data.setdefault(f"CHAT_{address}", chat)
+    db_set(f"{PREFIX_CHAT_INFO}{chat.id}", chat.to_json())
     await chat.send_message(
         f"You are all set!\n\nNow your fans can buy your share at {BASE_URL}/tg/buy/{address} to join your group!"
     )
@@ -211,7 +231,7 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
 
         # check if we know group wallet address
-        address = context.chat_data.get(KEY_ADDRESS)
+        address = db_get(f"{PREFIX_CHAT_ADDRESS}{chat.id}")
         if address == None:
             member = await context.bot.get_chat_member(
                 update.effective_chat.id, update.my_chat_member.from_user.id
@@ -260,7 +280,7 @@ async def reply_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
         return
-    context.chat_data.setdefault(KEY_ADDRESS, address)
+    db_set(f"{PREFIX_CHAT_ADDRESS}{update.effective_chat.id}", address)
     del context.chat_data[KEY_BIND_ADDRESS]
     await check_supply(update.effective_chat, address, context)
 
@@ -358,7 +378,7 @@ async def bind_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if member.status != ChatMemberStatus.OWNER:
         await update.message.reply_text("Only owner can do this.")
         return
-    address = context.chat_data.get(KEY_ADDRESS)
+    address = db_get(f"{PREFIX_CHAT_ADDRESS}{update.effective_chat.id}")
     if address == None:
         message = "Please enter your wallet address."
     else:
@@ -452,20 +472,71 @@ async def verify_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.debug(update)
-    await update.message.reply_text(
-        "Thanks for choosing Fans3, to continue, please choose if you want to create or join a Fans3 group",
-        reply_markup=InlineKeyboardMarkup(
+    message = await update.message.reply_text("A moment please...")
+    text = ""
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(os.environ["CONTRACT_ADDRESS"]), abi=ABI
+    )
+    address = db_get(f"{PREFIX_USER_ADDRESS}{update.message.from_user.id}")
+    if Web3.is_address(address):
+        holdings = contract.functions.getHoldings(
+            Web3.to_checksum_address(address)
+        ).call()
+        if holdings != None and len(holdings) > 0:
+            text += "\nGroups that you can join:\n"
+            for holding in holdings:
+                chat = context.bot_data.get(f"CHAT_{holding}")
+                title = "Unknown"
+                link = "#"
+                if chat != None:
+                    title = chat.title
+                    link = context.bot.export_chat_invite_link(chat.id)
+                text += f"[{title}({holding}]({link})\n"
+    group_text = ""
+    for k, info in db_range(PREFIX_CHAT_INFO):
+        if not k.startswith(PREFIX_CHAT_INFO):
+            break
+        chat = Chat.de_json(json.loads(info), context.bot)
+        chat_address = db_get(f"{PREFIX_CHAT_ADDRESS}{chat.id}")
+        price = contract.functions.getBuyPrice(
+            Web3.to_checksum_address(chat_address), 1
+        ).call()
+        priceEth = Web3.from_wei(price, "ether")
+        group_text += f"[{chat.title}]({BASE_URL}/tg/buy/{chat_address}) (`{priceEth} ETH` `{chat_address}`)\n"
+
+    if len(group_text) != 0:
+        text += "\nKnown groups: (click and buy a share to join)\n" + group_text
+
+    buttons = [[InlineKeyboardButton("Create a group", callback_data=str(CREATE))]]
+    if Web3.is_address(address):
+        buttons.append(
             [
-                [
-                    InlineKeyboardButton("Create a group", callback_data=str(CREATE)),
-                    InlineKeyboardButton("Join a group", callback_data=str(JOIN)),
-                ],
-                [
-                    InlineKeyboardButton("List known groups", callback_data=str(LIST)),
-                    InlineKeyboardButton("Cancel", callback_data=str(CANCEL)),
-                ],
+                InlineKeyboardButton(
+                    f"Change your wallet address({address})",
+                    callback_data=str(JOIN),
+                )
             ]
-        ),
+        )
+    elif len(text) != 0:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "Verify address and list groups that you can join",
+                    callback_data=str(JOIN),
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("Cancel", callback_data=str(CANCEL))])
+
+    if len(text) != 0:
+        text = "Thanks for choosing Fans3, join or create your own group!\n" + text
+    else:
+        text = "Thanks for choosing Fans3, no known group yet, let's create the first group!"
+
+    await message.edit_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
     return START
 
@@ -474,11 +545,11 @@ async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     """Handle create request."""
     logger.debug(update)
     query = update.callback_query
-    await query.answer("Invite this bot to your group to turn it into a Fans3 group!")
     await query.message.reply_text(
         "Invite this bot to your group to turn it into a Fans3 group!"
     )
-    await query.delete_message()
+    await query.answer("Invite this bot to your group to turn it into a Fans3 group!")
+    await query.edit_message_reply_markup(None)
     return ConversationHandler.END
 
 
@@ -487,10 +558,11 @@ async def join_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.debug(update)
     query = update.callback_query
     await query.message.reply_text(
-        "Tell me your wallet address to list your shares",
-        reply_markup=ForceReply(input_field_placeholder="Please enter your address"),
+        f"[Click here]({BASE_URL}/tg/verify/{urllib.parse.quote(query.from_user.username+'('+str(query.from_user.id)+')')}) to verify your address and then paste the code you got.",
+        reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
+        parse_mode=ParseMode.MARKDOWN,
     )
-    await query.delete_message()
+    await query.edit_message_reply_markup(None)
     return ADDRESS
 
 
@@ -499,13 +571,24 @@ async def join_group_with_address(
 ) -> int:
     """Handle user address binding."""
     logger.debug(update)
-    address = update.message.text
+    signatures = update.message.text.split("|")
+    if len(signatures) != 2:
+        await update.message.edit_message_text(
+            "Bad code, please enter a valid one",
+            reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
+        )
+        return ADDRESS
+    time = str(base64.b64decode(signatures[0]) or b"", "utf-8")
+    signature = base64.b64decode(signatures[1])
+    message = encode_defunct(
+        text=f"Sign this message to allow telegram user\n\n${update.message.from_user.username}(${str(update.message.from_user.id)})\n\nto join groups that you own a share.\n\nAvailable for 30 minutes.\nTime now: ${time}"
+    )
+    address = Account.recover_message(message, signature=signature)
+    db_set(f"{PREFIX_USER_ADDRESS}{update.message.from_user.id}", address)
     if not Web3.is_address(address):
-        await query.edit_message_text(
-            f"{address} is not a valid address, please enter a valid one",
-            reply_markup=ForceReply(
-                input_field_placeholder="Please enter your address"
-            ),
+        await update.message.edit_message_text(
+            "Bad code, can not recover your address from code, please enter a valid one",
+            reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
         )
         return ADDRESS
     contract = w3.eth.contract(
@@ -516,23 +599,10 @@ async def join_group_with_address(
     ).call()
     if holdings == None or len(holdings) == 0:
         await update.message.reply_text(
-            "You don't have any group share yet, to continue, please create one or list known groups",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "Create a group", callback_data=str(CREATE)
-                        ),
-                        InlineKeyboardButton(
-                            "List known groups", callback_data=str(LIST)
-                        ),
-                        InlineKeyboardButton("Cancel", callback_data=str(CANCEL)),
-                    ],
-                ]
-            ),
+            f"You are now {address} but no group share found, use /start to create or join one",
         )
-        return START
-    message = "Here are your group shares, click to join!\n\n"
+        return ConversationHandler.END
+    message = f"You are now {address}, here are your groups, click to join!\n\n"
     for holding in holdings:
         chat = context.bot_data.get(f"CHAT_{holding}")
         title = "Unknown"
@@ -540,36 +610,75 @@ async def join_group_with_address(
         if chat != None:
             title = chat.title
             link = context.bot.export_chat_invite_link(chat.id)
-        message += f"<a href='{link}'>{title}({holding})</a>\n"
-    await update.message.reply_html(message)
+        message += f"[{title}({holding})]({link})\n"
+    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 
 
 async def list_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle list request."""
     query = update.callback_query
-    chats = context.bot_data.get(KEY_CHATS)
-    if chats == None:
+    group_text = ""
+    for k, info in db_range(PREFIX_CHAT_INFO):
+        if not k.startswith(PREFIX_CHAT_INFO):
+            break
+        chat = Chat.de_json(json.loads(info), context.bot)
+        address = db_get(f"{PREFIX_CHAT_ADDRESS}{chat.id}")
+        group_text += f"[{chat.title}({address}]({BASE_URL}/tg/buy/{address})\n"
+
+    if len(group_text) == 0:
         await query.answer("No group yet, you can create one")
         return START
     await query.answer("Select a group to buy share and join")
     await query.delete_message()
-    message = "Here are known groups, buy a share and join!\n\n"
-    for chat in chats:
-        address = context.bot_data.get(f"ADDR_{chat.id}")
-        message += (
-            f"<a href='{BASE_URL}/tg/buy/{address}'>{chat.title}({address})</a>\n"
-        )
-    await query.message.reply_html(message)
+    await query.message.reply_text(
+        "Here are known groups, buy a share and join!\n\n" + group_text,
+        parse_mode=ParseMode.MARKDOWN,
+    )
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancels and ends the conversation."""
     query = update.callback_query
-    await query.delete_message()
     await query.message.reply_text("You can start with /start again at any time.")
+    await query.edit_message_reply_markup(None)
     return ConversationHandler.END
+
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels and ends the conversation."""
+    await update.effective_chat.send_message("Sorry, something went wrong...")
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    dev_chat_id = os.environ.get("DEVELOPER_CHAT_ID")
+    if dev_chat_id == None:
+        return
+    # traceback.format_exception returns the usual python message about an exception, but as a
+    # list of strings rather than a single string, so we have to join them together.
+    tb_list = traceback.format_exception(
+        None, context.error, context.error.__traceback__
+    )
+    tb_string = "".join(tb_list)
+
+    # Build the message with some markup and additional information about what happened.
+    # You might need to add some logic to deal with messages longer than the 4096 character limit.
+    update_str = update.to_dict() if isinstance(update, Update) else str(update)
+    message = f"""An exception was raised while handling an update
+
+```
+update = {json.dumps(update_str, indent=2, ensure_ascii=False)}
+
+context.chat_data = {str(context.chat_data)}
+
+context.user_data = {str(context.user_data)}
+
+{tb_string}
+```"""
+
+    # Finally, send the message
+    await context.bot.send_message(
+        chat_id=dev_chat_id, text=message, parse_mode=ParseMode.MARKDOWN
+    )
 
 
 # reference & examples
@@ -631,6 +740,8 @@ def main() -> None:
         ChatMemberHandler(greet_chat_members, ChatMemberHandler.CHAT_MEMBER)
     )
 
+    application.add_error_handler(error_handler)
+
     # Interpret any other command or text message as a start of a private chat.
     # This will record the user as being in a private chat with bot.
     # application.add_handler(MessageHandler(filters.ALL, start_private_chat))
@@ -639,6 +750,7 @@ def main() -> None:
     # We pass 'allowed_updates' handle *all* updates including `chat_member` updates
     # To reset this, simply pass `allowed_updates=[]`
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+    db.close()
 
 
 if __name__ == "__main__":
