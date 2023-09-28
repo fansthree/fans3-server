@@ -207,47 +207,14 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.info("%s added the bot to the group %s", cause_name, chat.title)
             context.bot_data.setdefault("group_ids", set()).add(chat.id)
 
-        # check if the bot is admin
-        member = update.my_chat_member.new_chat_member
-        if member.status != ChatMemberStatus.ADMINISTRATOR:
-            await update.effective_chat.send_message(
-                "Please promote me to admin to work."
-            )
-            return
-
-        # we are admin, now check group permission
-        current = (await context.bot.get_chat(chat.id)).permissions
-        if current.can_invite_users != False:
-            perms = current.to_dict()
-            perms["can_invite_users"] = False
-            await update.effective_chat.set_permissions(
-                ChatPermissions(api_kwargs=perms)
-            )
-            update.effective_chat.send_message(
-                "Permission changed to disallow users to invite others."
-            )
-
-        # check if we know group wallet address
-        address = db_get(f"{PREFIX_CHAT_ADDRESS}{chat.id}")
-        if address == None:
-            member = await context.bot.get_chat_member(
-                update.effective_chat.id, update.my_chat_member.from_user.id
-            )
-            if member.status != ChatMemberStatus.OWNER:
-                await update.effective_chat.send_message(
-                    "Group owner needs to set group address with command /bind_address."
-                )
-                return
-            context.chat_data.setdefault(KEY_BIND_ADDRESS, True)
-            await update.effective_chat.send_message(
-                "Now Tell us your wallet address, so that anyone bought your share can join this group.",
-                reply_markup=ForceReply(
-                    input_field_placeholder="Enter your wallet address"
-                ),
-            )
-            return
-
-        await check_supply(chat, address, context)
+        await group_start(
+            chat,
+            update.my_chat_member.new_chat_member,
+            await context.bot.get_chat_member(
+                chat.id, update.my_chat_member.from_user.id
+            ),
+            context,
+        )
 
     elif not was_member and is_member:
         logger.info("%s added the bot to the channel %s", cause_name, chat.title)
@@ -369,6 +336,9 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def bind_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
+        await update.message.reply_text("Only available in groups.")
+        return
     member = await context.bot.get_chat_member(
         update.effective_chat.id, update.message.from_user.id
     )
@@ -467,8 +437,55 @@ async def verify_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return "end"
 
 
+async def group_start(
+    chat: Chat,
+    member_bot: ChatMember,
+    member_user: ChatMember,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    # check if the bot is admin
+    if member_bot.status != ChatMemberStatus.ADMINISTRATOR:
+        await chat.send_message("Please promote me to admin to work.")
+        return
+
+    # we are admin, now check group permission
+    current = (await context.bot.get_chat(chat.id)).permissions
+    if current.can_invite_users != False:
+        perms = current.to_dict()
+        perms["can_invite_users"] = False
+        await chat.set_permissions(ChatPermissions(api_kwargs=perms))
+        chat.send_message("Permission changed to disallow users to invite others.")
+
+    # check if we know group wallet address
+    address = db_get(f"{PREFIX_CHAT_ADDRESS}{chat.id}")
+    if address == None:
+        if member_user.status != ChatMemberStatus.OWNER:
+            await chat.send_message(
+                "Group owner needs to set group address with command /bind_address."
+            )
+            return
+        context.chat_data.setdefault(KEY_BIND_ADDRESS, True)
+        await chat.send_message(
+            "Now Tell us your wallet address, so that anyone bought your share can join this group.",
+            reply_markup=ForceReply(
+                input_field_placeholder="Enter your wallet address"
+            ),
+        )
+        return
+
+    await check_supply(chat, address, context)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.debug(update)
+    if update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        await group_start(
+            update.effective_chat,
+            await update.effective_chat.get_member(context.bot.id),
+            await update.effective_chat.get_member(update.message.from_user.id),
+            context,
+        )
+        return
     message = await update.message.reply_text("A moment please...")
     text = ""
     contract = w3.eth.contract(
