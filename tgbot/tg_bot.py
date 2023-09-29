@@ -71,8 +71,11 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 sys.path.append(BASE_DIR)
 
 BASE_URL = os.environ["BASE_URL"]
-CANCEL, START, CREATE, VERIFY, JOIN, LIST, ADDRESS = range(7)
+STATE_VERIFY_ADDRESS = range(1)
 CALLBACK_CHECK_FIRST_SHARE = "check_first_share"
+CALLBACK_START_VERIFY_ADDRESS = "start_verify_address"
+CALLBACK_CREATE_GROUP = "create_group"
+CALLBACK_CANCEL = "CANCEL"
 PREFIX_CHAT_ADDRESS = "chat_addr_"
 PREFIX_USER_ADDRESS = "user_addr_"
 PREFIX_CHAT_INFO = "chat_info_"
@@ -117,8 +120,6 @@ logger = logging.getLogger(__name__)
 if os.environ["LOG_LEVEL"] != None:
     logger.setLevel(os.environ["LOG_LEVEL"])
 
-join_request_cache = {}
-
 
 def extract_status_change(
     chat_member_update: ChatMemberUpdated,
@@ -153,7 +154,7 @@ def extract_status_change(
 async def check_first_share(
     chat: Chat, address: str, context: ContextTypes.DEFAULT_TYPE
 ):
-    # check if your first share is bought
+    """Check if group's first share is bought"""
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(os.environ["CONTRACT_ADDRESS"]), abi=ABI
     )
@@ -237,7 +238,8 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.bot_data.setdefault("channel_ids", set()).discard(chat.id)
 
 
-async def reply_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reply_group_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bind address for a user"""
     # check if we are waiting for address in a group
     if (
         update.effective_chat.type not in [Chat.GROUP, Chat.SUPERGROUP]
@@ -292,168 +294,50 @@ async def greet_chat_members(
         )
 
 
-async def start_private_chat(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Greets the user and records that they started a chat with the bot if it's a private chat.
-    Since no `my_chat_member` update is issued when a user starts a private chat with the bot
-    for the first time, we have to track it explicitly here.
-    """
-    user_name = update.effective_user.full_name
-    chat = update.effective_chat
-    if chat.type != Chat.PRIVATE or chat.id in context.bot_data.get("user_ids", set()):
-        return
-
-    logger.info("%s started a private chat with the bot", user_name)
-    context.bot_data.setdefault("user_ids", set()).add(chat.id)
-
-    await update.effective_message.reply_text(
-        f"Welcome {user_name}. Use /show_chats to see what chats I'm in."
-    )
-
-
-# async def setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-#     """Sends a message with three inline buttons attached."""
-#     keyboard = [
-#         [
-#             InlineKeyboardButton("关联钱包地址", callback_data="bind_address"),
-#             InlineKeyboardButton("创建邀请链接", callback_data="create_invite_link"),
-#         ],
-#         [InlineKeyboardButton("Option 3-test", callback_data="3")],
-#         [InlineKeyboardButton("Option 4-test", callback_data="4")],
-#     ]
-
-#     reply_markup = InlineKeyboardMarkup(keyboard)
-
-#     await update.message.reply_text("Please choose:", reply_markup=reply_markup)
-
-# async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-#     """Parses the CallbackQuery and updates the message text."""
-#     query = update.callback_query
-
-#     # CallbackQueries need to be answered, even if no notification to the user is needed
-#     # Some clients may have trouble otherwise. See https://core.telegram.org/bots/api#callbackquery
-#     await query.answer()
-#     if query.data == "bind_address":
-#         await query.edit_message_text(text="使用命令/bind_address 要绑定的钱包地址")
-#     elif query.data == "create_invite_link":
-#         print(update.effective_chat.invite_link)
-#         link = await update.effective_chat.create_invite_link(member_limit=100)
-#         await query.edit_message_text(text=f"{link}")
-#     else:
-#         await query.edit_message_text(text=f"Selected option: {query.data}")
-
-
-async def end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Returns `ConversationHandler.END`, which tells the
-    ConversationHandler that the conversation is over.
-    """
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(text="See you next time!")
-    return ConversationHandler.END
-
-
-async def bind_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
-        await update.message.reply_text("Only available in groups.")
-        return
-    member = await context.bot.get_chat_member(
-        update.effective_chat.id, update.message.from_user.id
-    )
-    if member.status != ChatMemberStatus.OWNER:
-        await update.message.reply_text("Only owner can do this.")
-        return
-    address = db_get(f"{PREFIX_CHAT_ADDRESS}{update.effective_chat.id}")
-    if address == None:
-        message = "Please enter your wallet address."
-    else:
-        message = f"Your group address is {address}, change this will kick all members that do not own new one."
-    context.chat_data.setdefault(KEY_BIND_ADDRESS, True)
-    await update.message.reply_text(
-        message,
-        reply_markup=ForceReply(
-            input_field_placeholder="Please enter your wallet address"
-        ),
-    )
-    return
-
-
-async def create_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # link = await Chat(update.effective_chat, type=Chat.SUPERGROUP).create_invite_link()
-    link = await update.effective_chat.create_invite_link(
-        member_limit=100, creates_join_request=True
-    )
-    print("create invite link", link.invite_link)
-    await update.effective_message.reply_text(link.invite_link)
-
-
-async def join_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def verify_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     receive use join request
     1. get tg_user_id
     2. get user_address by input
     3. check whether user is accessible
     """
-    bot = context.bot
     user = update.chat_join_request.from_user
-    tg_user_name = update.chat_join_request.from_user.name
     chat = update.chat_join_request.chat
-    print(f"--------------user:{user.id} join chat:{chat.id} request")
-    try:
-        text = "You have to verify&bind your wallet address first"
-        reply_markup = InlineKeyboardMarkup.from_button(
-            InlineKeyboardButton(
-                text="verify & bind your wallet address",
-                callback_data=f"verify {chat.id}",
-            )
-        )
-        message = await context.bot.send_message(
+    address = db_get(f"{PREFIX_USER_ADDRESS}{user.id}")
+    shareHolder = db_get(f"{PREFIX_CHAT_ADDRESS}{chat.id}")
+    if address == None:
+        await context.bot.send_message(
             chat_id=update.chat_join_request.user_chat_id,
-            text=text,
-            reply_markup=reply_markup,
+            text="Join group failed as you don't have a verified address",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Verify your address to continue",
+                            callback_data=CALLBACK_START_VERIFY_ADDRESS,
+                        )
+                    ]
+                ]
+            ),
         )
-    except Forbidden:
-        # If the user blocked the bot, let's give the admins a chance to handle that
-        # TG also notifies the user and forwards the message once the user unblocks the bot, but
-        # forwarding it still doesn't hurt ...
-        text = (
-            f"User {user.mention_html()} with id {user.id} requested to join the group "
-            f"{update.chat_join_request.chat.username} but has blocked me. Please manually handle this."
-        )
-        print(text)
-        # await context.bot.send_message(chat_id=ERROR_CHANNEL_CHAT_ID, text=text)
+        await update.chat_join_request.decline()
         return
-
-
-async def start_verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    _, chat_id = query.data.split(" ")
-    user_id = query.from_user.id
-    join_request_cache[user_id] = chat_id
-    print(f"verify user:{update.callback_query.from_user.id} joining chat:{chat_id}")
-    text = f"Please use /verify_address your_wallet_address to verfiy your address"
-    message = await context.bot.send_message(
-        chat_id=update.effective_chat.id, text=text, reply_markup=ReplyKeyboardRemove()
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(os.environ["CONTRACT_ADDRESS"]), abi=ABI
     )
-    return "verify_address"
-
-
-async def verify_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    print(update.message.text)
-    user_id = update.message.from_user.id
-    requested_chat_id = join_request_cache.get(user_id, None)
-    if requested_chat_id is None:
-        print(f"verify_address cannot find user from request")
-        return
-    # TODO, request server to checkout whether user has bought shares
-    if True:
-        print(f"approve user:{user_id} joining chat:{requested_chat_id}")
-        await context.bot.approve_chat_join_request(requested_chat_id, user_id)
+    balance = contract.functions.sharesBalance(
+        Web3.to_checksum_address(shareHolder), Web3.to_checksum_address(address)
+    ).call()
+    if balance > 0:
+        await update.chat_join_request.approve()
     else:
-        print(f"decline user:{user_id} joining chat:{requested_chat_id}")
-        await context.bot.decline_chat_join_request(requested_chat_id, user_id)
-    return "end"
+        await context.bot.send_message(
+            chat_id=update.chat_join_request.user_chat_id,
+            text=f"Join group failed as you don't have a share, check your address or click [here]({BASE_URL}/tg/buy/{shareHolder}) to buy a share",
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+        await update.chat_join_request.decline()
 
 
 async def group_start(
@@ -462,6 +346,7 @@ async def group_start(
     member_user: ChatMember,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    """deal with group startup"""
     # check if the bot is admin
     if member_bot.status != ChatMemberStatus.ADMINISTRATOR:
         await chat.send_message("Please promote me to admin to work.")
@@ -496,6 +381,7 @@ async def group_start(
 
 
 async def get_link(chat_id: int, bot: Bot):
+    """Get an invite link for a group"""
     link = db_get(f"{PREFIX_CHAT_LINK}{chat_id}")
     if link != None and isinstance(link, str):
         return link
@@ -510,6 +396,7 @@ async def get_link(chat_id: int, bot: Bot):
 
 
 async def get_holdings(address: str, bot: Bot) -> str | None:
+    """Get holding groups of an address"""
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(os.environ["CONTRACT_ADDRESS"]), abi=ABI
     )
@@ -535,7 +422,8 @@ async def get_holdings(address: str, bot: Bot) -> str | None:
     return message
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start command handler"""
     logger.debug(update)
     if update.effective_chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
         await group_start(
@@ -580,7 +468,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             [
                 InlineKeyboardButton(
                     f"Change your wallet address({address})",
-                    callback_data=str(VERIFY),
+                    callback_data=CALLBACK_START_VERIFY_ADDRESS,
                 )
             ]
         )
@@ -589,12 +477,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             [
                 InlineKeyboardButton(
                     "Verify address and list groups that you can join",
-                    callback_data=str(VERIFY),
+                    callback_data=CALLBACK_START_VERIFY_ADDRESS,
                 )
             ]
         )
-    buttons.append([InlineKeyboardButton("Create a group", callback_data=str(CREATE))])
-    buttons.append([InlineKeyboardButton("Cancel", callback_data=str(CANCEL))])
+    buttons.append(
+        [InlineKeyboardButton("Create a group", callback_data=CALLBACK_CREATE_GROUP)]
+    )
+    buttons.append([InlineKeyboardButton("Cancel", callback_data=CALLBACK_CANCEL)])
 
     if len(text) != 0:
         text = "Thanks for choosing Fans3, join or create your own group!\n" + text
@@ -607,10 +497,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=InlineKeyboardMarkup(buttons),
         disable_web_page_preview=True,
     )
-    return START
 
 
-async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle create request."""
     logger.debug(update)
     query = update.callback_query
@@ -619,10 +508,11 @@ async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
     await query.answer("Invite this bot to your group to turn it into a Fans3 group!")
     await query.edit_message_reply_markup(None)
-    return ConversationHandler.END
 
 
-async def join_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start_verify_address(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
     """Handle join request."""
     logger.debug(update)
     query = update.callback_query
@@ -632,12 +522,10 @@ async def join_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         parse_mode=ParseMode.MARKDOWN,
     )
     await query.edit_message_reply_markup(None)
-    return ADDRESS
+    return STATE_VERIFY_ADDRESS
 
 
-async def join_group_with_address(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
+async def verify_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle user address binding."""
     logger.debug(update)
     signatures = update.message.text.split("|")
@@ -646,7 +534,7 @@ async def join_group_with_address(
             "Bad code, please enter a valid one",
             reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
         )
-        return ADDRESS
+        return STATE_VERIFY_ADDRESS
     time = str(base64.b64decode(signatures[0]) or b"", "utf-8")
     time_now = datetime.datetime.now(pytz.utc)
     time_sign = datetime.datetime.fromisoformat(time)
@@ -655,13 +543,13 @@ async def join_group_with_address(
             "Code from future, check your time or try it later",
             reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
         )
-        return ADDRESS
+        return STATE_VERIFY_ADDRESS
     elif time_now - datetime.timedelta(minutes=30) > time_sign:
         await update.message.reply_text(
             "Code expires, please try again",
             reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
         )
-        return ADDRESS
+        return STATE_VERIFY_ADDRESS
     signature = base64.b64decode(signatures[1])
     message = encode_defunct(
         text=f"Sign this message to allow telegram user\n\n{update.message.from_user.username}({str(update.message.from_user.id)})\n\nto join groups that you own a share.\n\nAvailable for 30 minutes.\nTime now: {time}"
@@ -674,7 +562,7 @@ async def join_group_with_address(
             "Bad code, can not recover your address from code, please enter a valid one",
             reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
         )
-        return ADDRESS
+        return STATE_VERIFY_ADDRESS
     holdings = await get_holdings(address, context.bot)
     if holdings == None:
         await update.message.reply_text(
@@ -690,35 +578,11 @@ async def join_group_with_address(
     return ConversationHandler.END
 
 
-async def list_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle list request."""
-    query = update.callback_query
-    group_text = ""
-    for k, info in db_range(PREFIX_CHAT_INFO):
-        if not k.startswith(PREFIX_CHAT_INFO):
-            break
-        chat = Chat.de_json(json.loads(info), context.bot)
-        address = db_get(f"{PREFIX_CHAT_ADDRESS}{chat.id}")
-        group_text += f"[{chat.title}({address}]({BASE_URL}/tg/buy/{address})\n"
-
-    if len(group_text) == 0:
-        await query.answer("No group yet, you can create one")
-        return START
-    await query.answer("Select a group to buy share and join")
-    await query.delete_message()
-    await query.message.reply_text(
-        "Here are known groups, buy a share and join!\n\n" + group_text,
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancels and ends the conversation."""
     query = update.callback_query
     await query.message.reply_text("You can start with /start again at any time.")
     await query.edit_message_reply_markup(None)
-    return ConversationHandler.END
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -764,56 +628,51 @@ def main() -> None:
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(os.environ["TGBOT_KEY"]).build()
 
+    # start command for chats and groups
+    application.add_handler(CommandHandler("start", start))
+
+    # create group callback
     application.add_handler(
-        ConversationHandler(
-            entry_points=[CommandHandler("start", start)],
-            states={
-                START: [
-                    CallbackQueryHandler(create_group, pattern="^" + str(CREATE) + "$"),
-                    CallbackQueryHandler(join_group, pattern="^" + str(VERIFY) + "$"),
-                    CallbackQueryHandler(list_group, pattern="^" + str(LIST) + "$"),
-                    CallbackQueryHandler(cancel, pattern="^" + str(CANCEL) + "$"),
-                ],
-                ADDRESS: [
-                    MessageHandler(filters.REPLY, join_group_with_address),
-                ],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-        )
+        CallbackQueryHandler(create_group, pattern=f"^{CALLBACK_CREATE_GROUP}$")
     )
+
+    # when clicking cancel
+    application.add_handler(
+        CallbackQueryHandler(cancel, pattern=f"^{CALLBACK_CANCEL}$")
+    )
+
+    # check if first group share is bought in groups
     application.add_handler(
         CallbackQueryHandler(start, pattern=f"^{CALLBACK_CHECK_FIRST_SHARE}$")
     )
 
-    application.add_handler(ChatJoinRequestHandler(callback=join_handler))
-    # application.add_handler(CallbackQueryHandler(verify, pattern="^verify"))
+    # verify address in private chat
     application.add_handler(
         ConversationHandler(
-            entry_points=[CallbackQueryHandler(start_verify, pattern="^verify")],
+            entry_points=[
+                CallbackQueryHandler(
+                    start_verify_address, pattern=f"^{CALLBACK_START_VERIFY_ADDRESS}$"
+                )
+            ],
             states={
-                "verify_address": [
-                    CommandHandler("verify_address", verify_address)
-                    # MessageHandler(filters=filters.ALL , callback=verify_start)
-                ],
-                # "end":[CallbackQueryHandler(verify, pattern="^verify")]
+                STATE_VERIFY_ADDRESS: [MessageHandler(filters.REPLY, verify_address)]
             },
-            fallbacks=[CallbackQueryHandler(start_verify, pattern="^verify")],
+            fallbacks=[CommandHandler("start", start)],
         )
     )
 
-    application.add_handler(CommandHandler("bind_address", bind_address))
-    application.add_handler(CommandHandler("get_link", create_invite_link))
+    # verify if a join request can be approved
+    application.add_handler(ChatJoinRequestHandler(callback=verify_join_request))
 
-    # application.add_handler(CommandHandler("setting", setting))
-    # application.add_handler(CallbackQueryHandler(button))
-
-    # # Keep track of which chats the bot is in
+    # Keep track of which chats the bot is in
     application.add_handler(
         ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER)
     )
-    application.add_handler(MessageHandler(filters.REPLY, reply_address))
 
-    # # Handle members joining/leaving chats.
+    # check replies when binding address
+    application.add_handler(MessageHandler(filters.REPLY, reply_group_address))
+
+    # Handle members joining/leaving chats.
     application.add_handler(
         ChatMemberHandler(greet_chat_members, ChatMemberHandler.CHAT_MEMBER)
     )
