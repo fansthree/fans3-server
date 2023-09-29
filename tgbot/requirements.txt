@@ -3,3 +3,4 @@ python-telegram-bot
 web3
 pysocks
 rocksdict
+pytz

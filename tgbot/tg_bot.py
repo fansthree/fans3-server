@@ -24,7 +24,7 @@ Press Ctrl-C on the command line or send a signal to the process to stop the
 bot.
 """
 
-import logging, os, sys, urllib, json, traceback, base64
+import logging, os, sys, urllib, json, traceback, base64, datetime, pytz
 
 from typing import Optional, Tuple
 
@@ -71,10 +71,13 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 sys.path.append(BASE_DIR)
 
 BASE_URL = os.environ["BASE_URL"]
-CANCEL, START, CREATE, JOIN, LIST, ADDRESS = range(6)
+CANCEL, START, CREATE, VERIFY, JOIN, LIST, ADDRESS = range(7)
+CALLBACK_CHECK_FIRST_SHARE = "check_first_share"
 PREFIX_CHAT_ADDRESS = "chat_addr_"
 PREFIX_USER_ADDRESS = "user_addr_"
 PREFIX_CHAT_INFO = "chat_info_"
+PREFIX_CHAT_LINK = "chat_link_"
+PREFIX_ADDRESS_CHATS = "addr_chat_"
 KEY_BIND_ADDRESS = "bind_address"
 ABI = json.load(open("fans3.json"))
 w3 = Web3(HTTPProvider(os.environ["ETH_RPC"]))
@@ -88,6 +91,10 @@ def db_get(key: str) -> str:
 def db_set(key: str, value: str):
     db[key] = value
     # bytes(value, "utf-8")
+
+
+def db_delete(key: str):
+    db.delete(key)
 
 
 def db_range(start: str, reverse: bool = False):
@@ -143,7 +150,9 @@ def extract_status_change(
     return was_member, is_member
 
 
-async def check_supply(chat: Chat, address: str, context: ContextTypes.DEFAULT_TYPE):
+async def check_first_share(
+    chat: Chat, address: str, context: ContextTypes.DEFAULT_TYPE
+):
     # check if your first share is bought
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(os.environ["CONTRACT_ADDRESS"]), abi=ABI
@@ -156,13 +165,17 @@ async def check_supply(chat: Chat, address: str, context: ContextTypes.DEFAULT_T
                 [
                     [
                         InlineKeyboardButton(
-                            "Buy your first share",
-                            login_url=LoginUrl(
-                                f"{BASE_URL}/tg/create?tg="
-                                + urllib.parse.quote(f"{chat.title}(id: {chat.id})"),
-                            ),
+                            "Buy the first share",
+                            url=f"{BASE_URL}/tg/create?tg="
+                            + urllib.parse.quote(f"{chat.title}(id: {chat.id})"),
                         ),
-                    ]
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "I've bought the first share",
+                            callback_data=CALLBACK_CHECK_FIRST_SHARE,
+                        ),
+                    ],
                 ]
             ),
         )
@@ -225,15 +238,17 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def reply_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.debug(update)
-    logger.debug(context)
+    # check if we are waiting for address in a group
+    if (
+        update.effective_chat.type not in [Chat.GROUP, Chat.SUPERGROUP]
+        or context.chat_data.get(KEY_BIND_ADDRESS) != True
+    ):
+        return
     member = await context.bot.get_chat_member(
         update.effective_chat.id, update.message.from_user.id
     )
     if member.status != ChatMemberStatus.OWNER:
         await update.message.reply_text("Only owner can do this.")
-        return
-    if context.chat_data.get(KEY_BIND_ADDRESS) != True:
         return
     address = update.message.text
     if not Web3.is_address(address):
@@ -245,8 +260,12 @@ async def reply_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     db_set(f"{PREFIX_CHAT_ADDRESS}{update.effective_chat.id}", address)
+    db_set(
+        f"{PREFIX_ADDRESS_CHATS}{address}_{update.effective_chat.id}",
+        update.effective_chat.id,
+    )
     del context.chat_data[KEY_BIND_ADDRESS]
-    await check_supply(update.effective_chat, address, context)
+    await check_first_share(update.effective_chat, address, context)
 
 
 async def greet_chat_members(
@@ -473,7 +492,47 @@ async def group_start(
         )
         return
 
-    await check_supply(chat, address, context)
+    await check_first_share(chat, address, context)
+
+
+async def get_link(chat_id: int, bot: Bot):
+    link = db_get(f"{PREFIX_CHAT_LINK}{chat_id}")
+    if link != None and isinstance(link, str):
+        return link
+    link = (
+        await bot.create_chat_invite_link(
+            chat_id, name="Fans3Bot", creates_join_request=True
+        )
+    ).invite_link
+    if link != None:
+        db_set(f"{PREFIX_CHAT_LINK}{chat_id}", link)
+    return link
+
+
+async def get_holdings(address: str, bot: Bot) -> str | None:
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(os.environ["CONTRACT_ADDRESS"]), abi=ABI
+    )
+    holdings = contract.functions.getHoldings(Web3.to_checksum_address(address)).call()
+    if holdings == None or len(holdings) == 0:
+        return None
+    message = ""
+    for holding in holdings:
+        prefix = f"{PREFIX_ADDRESS_CHATS}{holding}"
+        for k, chat_id in db_range(prefix):
+            if not k.startswith(prefix):
+                break
+            if db_get(f"{PREFIX_CHAT_ADDRESS}{chat_id}") != holding:
+                db_delete(f"{PREFIX_CHAT_ADDRESS}{chat_id}")
+                continue
+            chat = Chat.de_json(json.loads(db_get(f"{PREFIX_CHAT_INFO}{chat_id}")), bot)
+            title = "Unknown"
+            link = "#"
+            if chat != None:
+                title = chat.title
+                link = await get_link(chat.id, bot)
+            message += f"[{title}]({link})({holding})\n"
+    return message
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -482,7 +541,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await group_start(
             update.effective_chat,
             await update.effective_chat.get_member(context.bot.id),
-            await update.effective_chat.get_member(update.message.from_user.id),
+            await update.effective_chat.get_member(
+                (update.message or update.callback_query).from_user.id
+            ),
             context,
         )
         return
@@ -493,19 +554,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     address = db_get(f"{PREFIX_USER_ADDRESS}{update.message.from_user.id}")
     if Web3.is_address(address):
-        holdings = contract.functions.getHoldings(
-            Web3.to_checksum_address(address)
-        ).call()
-        if holdings != None and len(holdings) > 0:
-            text += "\nGroups that you can join:\n"
-            for holding in holdings:
-                chat = context.bot_data.get(f"CHAT_{holding}")
-                title = "Unknown"
-                link = "#"
-                if chat != None:
-                    title = chat.title
-                    link = context.bot.export_chat_invite_link(chat.id)
-                text += f"[{title}({holding}]({link})\n"
+        text = await get_holdings(address, context.bot)
+        if text == None:
+            text = ""
+        else:
+            text = "\nGroups that you can join:\n" + text
     group_text = ""
     for k, info in db_range(PREFIX_CHAT_INFO):
         if not k.startswith(PREFIX_CHAT_INFO):
@@ -521,13 +574,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if len(group_text) != 0:
         text += "\nKnown groups: (click and buy a share to join)\n" + group_text
 
-    buttons = [[InlineKeyboardButton("Create a group", callback_data=str(CREATE))]]
+    buttons = []
     if Web3.is_address(address):
         buttons.append(
             [
                 InlineKeyboardButton(
                     f"Change your wallet address({address})",
-                    callback_data=str(JOIN),
+                    callback_data=str(VERIFY),
                 )
             ]
         )
@@ -536,10 +589,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             [
                 InlineKeyboardButton(
                     "Verify address and list groups that you can join",
-                    callback_data=str(JOIN),
+                    callback_data=str(VERIFY),
                 )
             ]
         )
+    buttons.append([InlineKeyboardButton("Create a group", callback_data=str(CREATE))])
     buttons.append([InlineKeyboardButton("Cancel", callback_data=str(CANCEL))])
 
     if len(text) != 0:
@@ -551,6 +605,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         text,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(buttons),
+        disable_web_page_preview=True,
     )
     return START
 
@@ -587,17 +642,32 @@ async def join_group_with_address(
     logger.debug(update)
     signatures = update.message.text.split("|")
     if len(signatures) != 2:
-        await update.message.edit_message_text(
+        await update.message.reply_text(
             "Bad code, please enter a valid one",
             reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
         )
         return ADDRESS
     time = str(base64.b64decode(signatures[0]) or b"", "utf-8")
+    time_now = datetime.datetime.now(pytz.utc)
+    time_sign = datetime.datetime.fromisoformat(time)
+    if time_sign >= time_now:
+        await update.message.reply_text(
+            "Code from future, check your time or try it later",
+            reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
+        )
+        return ADDRESS
+    elif time_now - datetime.timedelta(minutes=30) > time_sign:
+        await update.message.reply_text(
+            "Code expires, please try again",
+            reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
+        )
+        return ADDRESS
     signature = base64.b64decode(signatures[1])
     message = encode_defunct(
-        text=f"Sign this message to allow telegram user\n\n${update.message.from_user.username}(${str(update.message.from_user.id)})\n\nto join groups that you own a share.\n\nAvailable for 30 minutes.\nTime now: ${time}"
+        text=f"Sign this message to allow telegram user\n\n{update.message.from_user.username}({str(update.message.from_user.id)})\n\nto join groups that you own a share.\n\nAvailable for 30 minutes.\nTime now: {time}"
     )
     address = Account.recover_message(message, signature=signature)
+    logger.debug(f"{time} {time_now} {time_sign} {signature} {message}")
     db_set(f"{PREFIX_USER_ADDRESS}{update.message.from_user.id}", address)
     if not Web3.is_address(address):
         await update.message.edit_message_text(
@@ -605,27 +675,18 @@ async def join_group_with_address(
             reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
         )
         return ADDRESS
-    contract = w3.eth.contract(
-        address=Web3.to_checksum_address(os.environ["CONTRACT_ADDRESS"]), abi=ABI
-    )
-    holdings = contract.functions.getHoldings(
-        Web3.to_checksum_address(Web3.to_checksum_address(address))
-    ).call()
-    if holdings == None or len(holdings) == 0:
+    holdings = await get_holdings(address, context.bot)
+    if holdings == None:
         await update.message.reply_text(
             f"You are now {address} but no group share found, use /start to create or join one",
         )
         return ConversationHandler.END
-    message = f"You are now {address}, here are your groups, click to join!\n\n"
-    for holding in holdings:
-        chat = context.bot_data.get(f"CHAT_{holding}")
-        title = "Unknown"
-        link = "#"
-        if chat != None:
-            title = chat.title
-            link = context.bot.export_chat_invite_link(chat.id)
-        message += f"[{title}({holding})]({link})\n"
-    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+    message = (
+        f"You are now {address}, here are your groups, click to join!\n\n" + holdings
+    )
+    await update.message.reply_text(
+        message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+    )
     return ConversationHandler.END
 
 
@@ -709,7 +770,7 @@ def main() -> None:
             states={
                 START: [
                     CallbackQueryHandler(create_group, pattern="^" + str(CREATE) + "$"),
-                    CallbackQueryHandler(join_group, pattern="^" + str(JOIN) + "$"),
+                    CallbackQueryHandler(join_group, pattern="^" + str(VERIFY) + "$"),
                     CallbackQueryHandler(list_group, pattern="^" + str(LIST) + "$"),
                     CallbackQueryHandler(cancel, pattern="^" + str(CANCEL) + "$"),
                 ],
@@ -719,6 +780,9 @@ def main() -> None:
             },
             fallbacks=[CommandHandler("cancel", cancel)],
         )
+    )
+    application.add_handler(
+        CallbackQueryHandler(start, pattern=f"^{CALLBACK_CHECK_FIRST_SHARE}$")
     )
 
     application.add_handler(ChatJoinRequestHandler(callback=join_handler))
