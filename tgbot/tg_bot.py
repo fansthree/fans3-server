@@ -6,16 +6,11 @@
 Usage:
 1. Message @BotFather to create a new bot, set the following commands with your bot.
 ```
-start - Start using this bot
-verify_address - Verify address
-bind_address - Bind address
-get_link - Get join link
+start - Start using Fans3
 ```
-2. use /set_domain to allow domain `demo.fans3.org`
+2. Run `pip3 install -r requirements.txt ` to install dependencies.
 
-3. Run `pip3 install -r requirements.txt ` to install dependencies.
-
-4. Put `TGBOT_KEY=xxx:xxxxxx` in `.env` file, then run
+3. Copy `.env.example` to `.env` file, fill `TGBOT_KEY` and `ETH_RPC`, then run
 ```
 python3 ./tg_bot.py
 ```
@@ -25,6 +20,10 @@ bot.
 """
 
 import logging, os, sys, urllib, json, traceback, base64, datetime, pytz
+
+MIN_PYTHON = (3, 11)
+if sys.version_info < MIN_PYTHON:
+    sys.exit("Python %s.%s or later is required.\n" % MIN_PYTHON)
 
 from typing import Optional, Tuple
 
