@@ -364,7 +364,7 @@ async def group_start(
     if address == None:
         if member_user.status != ChatMemberStatus.OWNER:
             await chat.send_message(
-                "Group owner needs to set group address with command /bind_address."
+                "Group owner needs to set group address with command /start."
             )
             return
         context.chat_data.setdefault(KEY_BIND_ADDRESS, True)
