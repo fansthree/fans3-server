@@ -515,8 +515,9 @@ async def start_verify_address(
     """Handle join request."""
     logger.debug(update)
     query = update.callback_query
+    user = query.from_user
     await query.message.reply_text(
-        f"[Click here]({BASE_URL}/tg/verify/{urllib.parse.quote(query.from_user.username+'('+str(query.from_user.id)+')')}) to verify your address and then paste the code you got.",
+        f"[Click here]({BASE_URL}/tg/verify/{urllib.parse.quote((user.username or user.full_name or user.first_name)+'('+str(user.id)+')')}) to verify your address and then paste the code you got.",
         reply_markup=ForceReply(input_field_placeholder="Paste the code here"),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -550,8 +551,9 @@ async def verify_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return STATE_VERIFY_ADDRESS
     signature = base64.b64decode(signatures[1])
+    user = update.message.from_user
     message = encode_defunct(
-        text=f"Sign this message to allow telegram user\n\n{update.message.from_user.username}({str(update.message.from_user.id)})\n\nto join groups that you own a share.\n\nAvailable for 30 minutes.\nTime now: {time}"
+        text=f"Sign this message to allow telegram user\n\n{(user.username or user.full_name or user.first_name)}({str(user.id)})\n\nto join groups that you own a share.\n\nAvailable for 30 minutes.\nTime now: {time}"
     )
     address = Account.recover_message(message, signature=signature)
     logger.debug(f"{time} {time_now} {time_sign} {signature} {message}")
